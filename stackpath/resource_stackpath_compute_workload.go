@@ -3,13 +3,16 @@ package stackpath
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/http"
+	"strings"
+	"time"
 
+	"github.com/hashicorp/terraform-plugin-sdk/helper/resource"
+	"github.com/hashicorp/terraform-plugin-sdk/helper/schema"
 	"github.com/terraform-providers/terraform-provider-stackpath/stackpath/api/workload/workload_client/instances"
 	"github.com/terraform-providers/terraform-provider-stackpath/stackpath/api/workload/workload_client/workloads"
 	"github.com/terraform-providers/terraform-provider-stackpath/stackpath/api/workload/workload_models"
-
-	"github.com/hashicorp/terraform-plugin-sdk/helper/schema"
 )
 
 // annotation keys that should be ignored when diffing the state of a workload
@@ -386,6 +389,108 @@ func resourceComputeWorkloadCreate(data *schema.ResourceData, meta interface{}) 
 
 	// Set the ID based on the workload created in the API
 	data.SetId(resp.Payload.Workload.ID)
+
+	lastInstancePhases := make(map[string]workload_models.Workloadv1InstanceInstancePhase, 0)
+
+	wait := resource.StateChangeConf{
+		Pending: []string{"starting"},
+		Target: []string{"done"},
+		Timeout: 5 * time.Minute,
+		Refresh: func() (interface{}, string, error) {
+			status := "starting"
+			allStarted := true
+			workloadInstances := make([]workload_models.Workloadv1Instance, 0)
+
+			// Get all workload instances in groups of 50
+			pageSize := "50"
+			var endCursor string
+			for {
+				params := &instances.GetWorkloadInstancesParams{
+					StackID:          config.StackID,
+					WorkloadID:       data.Id(),
+					Context:          context.Background(),
+					PageRequestFirst: &pageSize,
+				}
+				if endCursor != "" {
+					params.PageRequestAfter = &endCursor
+				}
+
+				resp, err := config.edgeCompute.Instances.GetWorkloadInstances(params, nil)
+				if err != nil {
+					return nil, "", fmt.Errorf("failed to read compute workload instances: %v", NewStackPathError(err))
+				}
+
+				for _, result := range resp.Payload.Results {
+					if result != nil {
+						workloadInstances = append(workloadInstances, *result)
+					}
+				}
+
+				// Continue paginating until we get all the results
+				if !resp.Payload.PageInfo.HasNextPage {
+					break
+				}
+				endCursor = resp.Payload.PageInfo.EndCursor
+			}
+
+			// If there aren't any workload instances then the workload was
+			// created but instances aren't yet. Short circuit early to wait for
+			// instances to show up.
+			if len(workloadInstances) == 0 {
+				return resp, status, nil
+			}
+
+			for _, instance := range workloadInstances {
+				if phase, found := lastInstancePhases[instance.Name]; found {
+					if phase != instance.Phase {
+						log.Printf(
+							"[INFO] Workload %s instance %s: %s -> %s",
+							resp.Payload.Workload.Name,
+							instance.Name,
+							strings.ToLower(string(phase)),
+							strings.ToLower(string(instance.Phase)),
+						)
+					}
+				} else {
+					log.Printf(
+						"[INFO] Workload %s instance %s: %s",
+						resp.Payload.Workload.Name,
+						instance.Name,
+						strings.ToLower(string(instance.Phase)),
+					)
+				}
+
+				lastInstancePhases[instance.Name] = instance.Phase
+			}
+
+			for name, phase := range lastInstancePhases {
+				if phase == workload_models.Workloadv1InstanceInstancePhaseSTARTING {
+					allStarted = false
+				}
+
+				if phase == workload_models.Workloadv1InstanceInstancePhaseFAILED {
+					log.Printf("[ERROR] Instance %s failed to start", name)
+					return nil, "", fmt.Errorf(
+						"workload %s instance %s failed to start",
+						resp.Payload.Workload.Name,
+						name,
+					)
+				}
+			}
+
+			if allStarted {
+				log.Printf("[INFO] All workload %s instances have started", resp.Payload.Workload.Name)
+				status = "done"
+			}
+
+			return resp, status, err
+		},
+	}
+
+	_, err = wait.WaitForState()
+	if err != nil {
+		return err
+	}
 
 	return resourceComputeWorkloadRead(data, meta)
 }
